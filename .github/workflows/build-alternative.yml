@@ -1,0 +1,127 @@
+name: Build and push image
+
+on:
+  pull_request:
+  push:
+    paths-ignore:
+      - "**.md"
+  workflow_dispatch:
+    inputs:
+      ssh_session:
+        description: "Enable interactive SSH debugging session"
+        type: boolean
+        required: false
+        default: false
+
+env:
+  anki_version: "25.09.2"
+  RUST_TARGET: "x86_64-unknown-linux-gnu"
+  DOCKER_PLATFORM: "linux-amd64"
+
+jobs:
+  build-packages:
+    name: Build package (amd64)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Clone ankitects/anki repository
+        uses: actions/checkout@v4
+        with:
+          repository: ankitects/anki
+          ref: ${{ env.anki_version }}
+          path: ankitects-anki
+          submodules: true
+
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Install C Compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install gcc g++
+
+      - name: Build anki-sync-server
+        working-directory: ./ankitects-anki
+        run: |
+          rustup target add ${{ env.RUST_TARGET }}
+          PROTOC=$(which protoc) \
+          RUSTFLAGS='-C target-feature=+crt-static' \
+          cargo build --release --target ${{ env.RUST_TARGET }} --package anki-sync-server
+
+      - name: Upload binary as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: anki-sync-server-${{ env.DOCKER_PLATFORM }}
+          path: ${{ github.workspace }}/ankitects-anki/target/${{ env.RUST_TARGET }}/release/anki-sync-server
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Setup interactive ssh session
+        if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.ssh_session }}
+        uses: Warpbuilds/action-debugger@v1.3
+        timeout-minutes: 20
+        with:
+          limit-access-to-actor: true
+
+  build-and-push-image:
+    name: Build and push Docker image
+    needs: [build-packages]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: anki-sync-server-${{ env.DOCKER_PLATFORM }}
+          path: target/anki-sync-server-${{ env.DOCKER_PLATFORM }}
+
+      - name: Docker get Metadata
+        id: metadata
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ghcr.io/${{ github.repository_owner }}/anki-sync-server${{ (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') && '' || '-dev' }}
+          flavor: |
+            latest=false
+            prefix=${{ github.event_name == 'pull_request' && format('pr-{0}-', github.event.number) || (github.ref_name != 'main' && format('branch-{0}-', github.ref_name) || '') }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}},priority=950
+            type=raw,value=${{ env.anki_version }},priority=900
+            type=sha
+            type=ref,event=pr
+          labels: |
+            org.opencontainers.image.title=Anki Sync Server
+            org.opencontainers.image.url=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=Anki Sync Server fork
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ env.anki_version }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          platforms: linux/amd64
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
